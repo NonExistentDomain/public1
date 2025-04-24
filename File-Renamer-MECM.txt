@@ -1,0 +1,314 @@
+<#
+.SYNOPSIS
+    Finds and renames files with .abc or .cft extensions to .abc.old or .cft.old on the local computer.
+    Designed for MECM Task Sequence deployment with reporting.
+
+.DESCRIPTION
+    This script scans all local drives for files with .abc or .cft extensions,
+    renames them to add .old to their extension, and generates reports for MECM.
+
+.NOTES
+    File Name      : Rename-SpecificExtensions.ps1
+    Author         : MECM Administrator
+    Prerequisite   : PowerShell 5.0
+    For use in MECM Task Sequence
+#>
+
+# Ensure we stop on all errors so Task Sequence can catch failures
+$ErrorActionPreference = "Stop"
+
+# Define log file paths - use standard MECM log locations
+$logPath = "$env:SystemDrive\Windows\Logs\Software"
+$mainLogFile = "$logPath\RenameExtensions.log"
+$csvReportFile = "$logPath\RenameExtensions_Report.csv"
+
+# Create log directory if it doesn't exist
+if (-not (Test-Path -Path $logPath)) {
+    New-Item -Path $logPath -ItemType Directory -Force | Out-Null
+}
+
+# Function to write to the log file
+function Write-Log {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("Information", "Warning", "Error")]
+        [string]$Level = "Information"
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "$timestamp [$Level] $Message"
+    
+    # Write to log file
+    Add-Content -Path $mainLogFile -Value $logEntry
+    
+    # Output to console for Task Sequence log capture
+    switch ($Level) {
+        "Information" { Write-Host $logEntry }
+        "Warning" { Write-Host $logEntry -ForegroundColor Yellow }
+        "Error" { Write-Host $logEntry -ForegroundColor Red }
+    }
+}
+
+# Function to exit with the proper code for MECM
+function Exit-Script {
+    param (
+        [Parameter(Mandatory = $true)]
+        [bool]$Success,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$Message = ""
+    )
+    
+    if ($Success) {
+        Write-Log "Script completed successfully: $Message" -Level "Information"
+        # Exit with success code for MECM
+        exit 0
+    }
+    else {
+        Write-Log "Script failed: $Message" -Level "Error"
+        # Exit with failure code for MECM
+        exit 1
+    }
+}
+
+# Initialize script
+Write-Log "Starting file extension rename script on computer: $env:COMPUTERNAME"
+Write-Log "PowerShell version: $($PSVersionTable.PSVersion.ToString())"
+
+# Initialize results collection
+$results = @()
+$errorCount = 0
+$renamedCount = 0
+$alreadyRenamedCount = 0
+$totalFilesFound = 0
+
+try {
+    # Get all fixed drives (excluding network and removable drives for reliability in Task Sequence)
+    Write-Log "Identifying local fixed drives..."
+    $drives = Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType = 3" | Select-Object -ExpandProperty DeviceID
+    Write-Log "Found $($drives.Count) fixed drives: $($drives -join ', ')"
+    
+    foreach ($drive in $drives) {
+        Write-Log "Scanning drive $drive..."
+        
+        try {
+            # Create arrays to store the results for this drive
+            $driveFoundFiles = @()
+            
+            # Find .abc files
+            Write-Log "Searching for .abc files on drive $drive..."
+            $abcFiles = Get-ChildItem -Path "$drive\" -Filter "*.abc" -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable +getErrors
+            $driveFoundFiles += $abcFiles
+            
+            # Find .cft files
+            Write-Log "Searching for .cft files on drive $drive..."
+            $cftFiles = Get-ChildItem -Path "$drive\" -Filter "*.cft" -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable +getErrors
+            $driveFoundFiles += $cftFiles
+            
+            # Find already renamed files
+            Write-Log "Searching for already renamed .abc.old and .cft.old files on drive $drive..."
+            $abcOldFiles = Get-ChildItem -Path "$drive\" -Filter "*.abc.old" -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable +getErrors
+            $cftOldFiles = Get-ChildItem -Path "$drive\" -Filter "*.cft.old" -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable +getErrors
+            
+            $totalFilesFound += $driveFoundFiles.Count + $abcOldFiles.Count + $cftOldFiles.Count
+            
+            Write-Log "Found $($driveFoundFiles.Count) files to process on drive $drive"
+            Write-Log "Found $($abcOldFiles.Count + $cftOldFiles.Count) already renamed files on drive $drive"
+            
+            # Process files that need to be renamed
+            foreach ($file in $driveFoundFiles) {
+                $newName = "$($file.FullName).old"
+                
+                # Check if file is not already renamed
+                if (-not ($file.Name -like "*.old")) {
+                    try {
+                        Write-Log "Renaming file: $($file.FullName) to $($file.Name).old"
+                        Rename-Item -Path $file.FullName -NewName $newName -ErrorAction Stop
+                        $renamedCount++
+                        
+                        $results += [PSCustomObject]@{
+                            ComputerName = $env:COMPUTERNAME
+                            Drive = $drive
+                            FilePath = $file.FullName
+                            OriginalName = $file.Name
+                            NewName = "$($file.Name).old"
+                            Action = "Renamed"
+                            ErrorMessage = $null
+                        }
+                    }
+                    catch {
+                        $errorCount++
+                        Write-Log "Failed to rename file: $($file.FullName) - $($_.Exception.Message)" -Level "Error"
+                        
+                        $results += [PSCustomObject]@{
+                            ComputerName = $env:COMPUTERNAME
+                            Drive = $drive
+                            FilePath = $file.FullName
+                            OriginalName = $file.Name
+                            NewName = "$($file.Name).old"
+                            Action = "Failed to Rename"
+                            ErrorMessage = $_.Exception.Message
+                        }
+                    }
+                }
+            }
+            
+            # Process already renamed files
+            foreach ($file in $abcOldFiles + $cftOldFiles) {
+                $alreadyRenamedCount++
+                
+                $results += [PSCustomObject]@{
+                    ComputerName = $env:COMPUTERNAME
+                    Drive = $drive
+                    FilePath = $file.FullName
+                    OriginalName = $file.Name
+                    NewName = $file.Name
+                    Action = "Already Renamed"
+                    ErrorMessage = $null
+                }
+            }
+            
+            # Process any access errors during file search
+            foreach ($err in $getErrors) {
+                $errorCount++
+                Write-Log "Access error during scan: $($err.TargetObject) - $($err.Exception.Message)" -Level "Warning"
+                
+                $results += [PSCustomObject]@{
+                    ComputerName = $env:COMPUTERNAME
+                    Drive = $drive
+                    FilePath = $err.TargetObject
+                    OriginalName = $null
+                    NewName = $null
+                    Action = "Access Error"
+                    ErrorMessage = $err.Exception.Message
+                }
+            }
+        }
+        catch {
+            $errorCount++
+            Write-Log "Error scanning drive $drive : $($_.Exception.Message)" -Level "Error"
+            
+            $results += [PSCustomObject]@{
+                ComputerName = $env:COMPUTERNAME
+                Drive = $drive
+                FilePath = "$drive\"
+                OriginalName = $null
+                NewName = $null
+                Action = "Drive Scan Error"
+                ErrorMessage = $_.Exception.Message
+            }
+        }
+    }
+    
+    # Export results to CSV
+    if ($results.Count -gt 0) {
+        $results | Export-Csv -Path $csvReportFile -NoTypeInformation -Force
+        Write-Log "Exported $($results.Count) entries to CSV report: $csvReportFile"
+    }
+    else {
+        Write-Log "No files were found or processed. No CSV report generated."
+        
+        # Add a "no files found" entry to the results
+        $results += [PSCustomObject]@{
+            ComputerName = $env:COMPUTERNAME
+            Drive = "N/A"
+            FilePath = $null
+            OriginalName = $null
+            NewName = $null
+            Action = "No Files Found"
+            ErrorMessage = $null
+        }
+        
+        $results | Export-Csv -Path $csvReportFile -NoTypeInformation -Force
+    }
+    
+    # Create registry entries for MECM reporting
+    Write-Log "Creating registry entries for MECM compliance reporting..."
+    
+    $registryPath = "HKLM:\SOFTWARE\CompanyName\FileExtensionRename"
+    
+    # Create registry key if it doesn't exist
+    if (-not (Test-Path $registryPath)) {
+        New-Item -Path $registryPath -Force | Out-Null
+    }
+    
+    # Set registry values
+    New-ItemProperty -Path $registryPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $registryPath -Name "TotalFilesFound" -Value $totalFilesFound -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $registryPath -Name "FilesRenamed" -Value $renamedCount -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $registryPath -Name "FilesAlreadyRenamed" -Value $alreadyRenamedCount -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $registryPath -Name "ErrorCount" -Value $errorCount -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $registryPath -Name "LogFile" -Value $mainLogFile -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $registryPath -Name "CSVReport" -Value $csvReportFile -PropertyType String -Force | Out-Null
+    
+    # Set compliance status for MECM detection
+    if ($errorCount -eq 0 -or ($renamedCount -gt 0 -and $errorCount -lt $renamedCount)) {
+        New-ItemProperty -Path $registryPath -Name "ComplianceStatus" -Value 1 -PropertyType DWord -Force | Out-Null
+        Write-Log "Compliance status set to compliant (1)"
+    }
+    else {
+        New-ItemProperty -Path $registryPath -Name "ComplianceStatus" -Value 0 -PropertyType DWord -Force | Out-Null
+        Write-Log "Compliance status set to non-compliant (0)"
+    }
+    
+    # Output final summary for MECM logs
+    Write-Log "===== SUMMARY ====="
+    Write-Log "Total files found: $totalFilesFound"
+    Write-Log "Files renamed: $renamedCount"
+    Write-Log "Files already renamed: $alreadyRenamedCount"
+    Write-Log "Errors encountered: $errorCount"
+    
+    # Exit with appropriate code for MECM
+    if ($errorCount -eq 0 -or ($renamedCount -gt 0 -and $errorCount -lt $renamedCount)) {
+        Exit-Script -Success $true -Message "Successfully renamed $renamedCount files with $errorCount errors"
+    }
+    else {
+        Exit-Script -Success $false -Message "Encountered $errorCount errors while renaming $renamedCount files"
+    }
+}
+catch {
+    Write-Log "Critical error in script execution: $($_.Exception.Message)" -Level "Error"
+    
+    # Try to write to the registry for reporting
+    try {
+        $registryPath = "HKLM:\SOFTWARE\CompanyName\FileExtensionRename"
+        
+        if (-not (Test-Path $registryPath)) {
+            New-Item -Path $registryPath -Force | Out-Null
+        }
+        
+        New-ItemProperty -Path $registryPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $registryPath -Name "CriticalError" -Value $_.Exception.Message -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $registryPath -Name "ComplianceStatus" -Value 0 -PropertyType DWord -Force | Out-Null
+    }
+    catch {
+        Write-Log "Failed to write to registry: $($_.Exception.Message)" -Level "Error"
+    }
+    
+    Exit-Script -Success $false -Message "Critical script failure"
+}
+
+
+#----------
+<#
+MECM Compliance Reporting Configuration
+For MECM reporting, create a Configuration Item with these settings:
+
+Create a new Configuration Item
+Add a Setting:
+
+Setting type: Script
+Data type: Boolean
+Discovery script (PowerShell):
+#>
+$registryPath = "HKLM:\SOFTWARE\CompanyName\FileExtensionRename"
+if (Test-Path $registryPath) {
+    $status = Get-ItemProperty -Path $registryPath -Name "ComplianceStatus" -ErrorAction SilentlyContinue
+    if ($status -and $status.ComplianceStatus -eq 1) {
+        return $true
+    }
+}
+return $false

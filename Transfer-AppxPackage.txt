@@ -1,0 +1,32 @@
+# Define the target folder path
+$path = "C:\Program Files\WindowsApps"
+
+# Store the original ACL to restore later
+$originalAcl = Get-Acl -Path $path
+
+# Get the current user's identity
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$account = New-Object System.Security.Principal.NTAccount($user)
+
+# Create a new ACL object for modification
+$acl = Get-Acl -Path $path
+
+# Change the owner to the current user
+$acl.SetOwner($account)
+
+# Grant the current user full control with inheritance to subfolders and files
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($user, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+$acl.AddAccessRule($rule)
+
+# Apply the modified ACL to the folder
+Set-Acl -Path $path -AclObject $acl
+
+# Inform the user that permissions are modified and wait for their actions
+Write-Host "Permissions have been modified. You can now copy the app package folders into $path and run the registration commands (e.g., Add-AppxPackage -Register)."
+Write-Host "When you are done, press Enter to restore the original permissions."
+$null = Read-Host
+
+# Restore the original ACL, including the original owner and permissions
+Set-Acl -Path $path -AclObject $originalAcl
+
+Write-Host "Original permissions have been restored."
