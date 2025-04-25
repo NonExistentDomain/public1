@@ -1,0 +1,68 @@
+# Define output CSV path
+$OutputCsvPath = "\\fileserver\admin$\CertificateRenamer\CertificateRenamer_Results.csv"
+
+# Get all file system drives
+$drives = Get-PSDrive -PSProvider FileSystem
+
+# Initialize report array
+$report = @()
+
+# Search for target files
+$files = @()
+foreach ($drive in $drives) {
+    $files += Get-ChildItem -Path $drive.Root -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '\.(abc|cft)(\.old)?$' }
+}
+
+# Process each file
+foreach ($file in $files) {
+    $status = $null
+    if ($file.Name -match '\.(abc|cft)\.old$') {
+        $status = "Already Renamed"
+    }
+    elseif ($file.Name -match '\.(abc|cft)$') {
+        $newName = $file.Name + ".old"
+        try {
+            Rename-Item -Path $file.FullName -NewName $newName -ErrorAction Stop
+            $status = "Renamed"
+        }
+        catch {
+            $status = "Failed to Rename: $_"
+        }
+    }
+    $report += [PSCustomObject]@{
+        ComputerName = $env:COMPUTERNAME
+        FilePath     = $file.FullName
+        Status       = $status
+    }
+}
+
+# If no files found, add a record
+if ($files.Count -eq 0) {
+    $report += [PSCustomObject]@{
+        ComputerName = $env:COMPUTERNAME
+        FilePath     = "N/A"
+        Status       = "No files found"
+    }
+}
+
+# Convert report to CSV lines without headers
+$csvLines = $report | ConvertTo-Csv -NoTypeInformation | Select-Object -Skip 1
+
+# Append to CSV file with retries
+$maxRetries = 5
+$retryDelay = 2 # seconds
+for ($i = 1; $i -le $maxRetries; $i++) {
+    try {
+        Add-Content -Path $OutputCsvPath -Value $csvLines -ErrorAction Stop
+        break
+    }
+    catch {
+        if ($i -eq $maxRetries) {
+            Write-Error "Failed to write to CSV after $maxRetries attempts: $_"
+        }
+        else {
+            Start-Sleep -Seconds $retryDelay
+        }
+    }
+}
