@@ -1,0 +1,465 @@
+<#
+.SYNOPSIS
+    Updates the signature of an exported Microsoft Store application package (.appx/.msix).
+.DESCRIPTION
+    This script takes an exported Microsoft Store application package and updates its signature
+    to make it installable on the target computer. It uses the SignTool from the Windows SDK
+    to properly sign the package with a temporary certificate if needed.
+.PARAMETER PackagePath
+    Path to the .appx or .msix package file to update
+.PARAMETER OutputPath
+    Directory where the updated package will be saved (defaults to same directory as input)
+.PARAMETER ForceResign
+    Switch to force re-sign the package even if it appears to be valid
+.EXAMPLE
+    .\Update-AppxSignature.ps1 -PackagePath "C:\Exports\Microsoft.WindowsTerminal_1.12.10393.0_x64__8wekyb3d8bbwe.msix"
+.EXAMPLE
+    .\Update-AppxSignature.ps1 -PackagePath "C:\Exports\Microsoft.WindowsTerminal_1.12.10393.0_x64__8wekyb3d8bbwe.msix" -OutputPath "C:\Updated" -ForceResign
+.NOTES
+    Requires administrative privileges
+    Windows SDK (specifically MakeAppx.exe and SignTool.exe) is required
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory=$true)]
+    [string]$PackagePath,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = "",
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$ForceResign
+)
+
+# Function to write formatted log messages
+function Write-Log {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("Info", "Warning", "Error", "Success")]
+        [string]$Level = "Info"
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $color = switch ($Level) {
+        "Info"    { "Cyan" }
+        "Warning" { "Yellow" }
+        "Error"   { "Red" }
+        "Success" { "Green" }
+    }
+    
+    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
+}
+
+# Function to find Windows SDK tools
+function Find-SdkTool {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$ToolName
+    )
+    
+    $sdkPaths = @(
+        # Try common Windows SDK paths for different versions
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.22621.0\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.22000.0\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.19041.0\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.18362.0\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.17763.0\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.17134.0\x64",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.16299.0\x64"
+    )
+    
+    # Check all paths
+    foreach ($path in $sdkPaths) {
+        $toolPath = Join-Path -Path $path -ChildPath "$ToolName.exe"
+        if (Test-Path -Path $toolPath) {
+            return $toolPath
+        }
+    }
+    
+    # Still not found, try to search recursively
+    $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+    if (Test-Path -Path $sdkRoot) {
+        $foundTools = Get-ChildItem -Path $sdkRoot -Recurse -Filter "$ToolName.exe" -ErrorAction SilentlyContinue
+        if ($foundTools.Count -gt 0) {
+            return $foundTools[0].FullName
+        }
+    }
+    
+    # Try to find it in PATH
+    try {
+        $inPath = Get-Command "$ToolName.exe" -ErrorAction SilentlyContinue
+        if ($inPath) {
+            return $inPath.Source
+        }
+    } catch {}
+    
+    return $null
+}
+
+# Function to create a self-signed certificate for package signing
+function New-AppxCertificate {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$CertificatePath
+    )
+    
+    $subjectName = "CN=AppxSigningCert"
+    $cert = New-SelfSignedCertificate -Type Custom -Subject $subjectName -KeyUsage DigitalSignature `
+        -FriendlyName "AppxSigningCert" -CertStoreLocation "Cert:\CurrentUser\My" `
+        -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+    
+    # Export the certificate with private key
+    $password = ConvertTo-SecureString -String "Temp1234!" -Force -AsPlainText
+    Export-PfxCertificate -Cert $cert -FilePath $CertificatePath -Password $password | Out-Null
+    
+    # Export the public certificate for installation
+    $certPublicPath = [System.IO.Path]::ChangeExtension($CertificatePath, ".cer")
+    Export-Certificate -Cert $cert -FilePath $certPublicPath | Out-Null
+    
+    # Return both paths and the certificate object
+    return @{
+        PfxPath = $CertificatePath
+        CerPath = $certPublicPath
+        Certificate = $cert
+        Password = $password
+    }
+}
+
+# Function to validate an appx/msix package
+function Test-AppxPackage {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$PackagePath
+    )
+    
+    try {
+        # Use Add-AppxPackage with -WhatIf to check if the package is valid
+        Add-AppxPackage -Path $PackagePath -WhatIf -ErrorAction Stop
+        return $true
+    }
+    catch {
+        if ($_.Exception.Message -like "*invalid signature*" -or 
+            $_.Exception.Message -like "*signature is not valid*" -or
+            $_.Exception.Message -like "*publisher name does not match*") {
+            Write-Log "Package signature validation failed: $($_.Exception.Message)" -Level "Warning"
+            return $false
+        }
+        elseif ($_.Exception.Message -like "*cannot be opened*" -or
+               $_.Exception.Message -like "*is not a valid package*") {
+            Write-Log "Package format validation failed: $($_.Exception.Message)" -Level "Error"
+            return $false
+        }
+        else {
+            Write-Log "Unknown validation error: $($_.Exception.Message)" -Level "Warning"
+            return $false
+        }
+    }
+}
+
+# Function to extract the appx/msix package
+function Expand-AppxPackage {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$PackagePath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$ExtractPath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$MakeAppxPath
+    )
+    
+    # Create extraction directory if it doesn't exist
+    if (-not (Test-Path -Path $ExtractPath)) {
+        New-Item -ItemType Directory -Path $ExtractPath -Force | Out-Null
+    }
+    
+    # Extract the package using MakeAppx
+    $makeAppxArgs = "unpack /p `"$PackagePath`" /d `"$ExtractPath`" /l"
+    $process = Start-Process -FilePath $MakeAppxPath -ArgumentList $makeAppxArgs -NoNewWindow -Wait -PassThru
+    
+    if ($process.ExitCode -ne 0) {
+        Write-Log "Failed to extract package with exit code $($process.ExitCode)" -Level "Error"
+        return $false
+    }
+    
+    # Verify AppxManifest.xml exists
+    $manifestPath = Join-Path -Path $ExtractPath -ChildPath "AppxManifest.xml"
+    if (-not (Test-Path -Path $manifestPath)) {
+        Write-Log "AppxManifest.xml not found in extracted package" -Level "Error"
+        return $false
+    }
+    
+    return $true
+}
+
+# Function to repackage the appx/msix package
+function New-AppxPackage {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$SourcePath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$OutputPath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$MakeAppxPath
+    )
+    
+    # Repackage using MakeAppx
+    $makeAppxArgs = "pack /d `"$SourcePath`" /p `"$OutputPath`" /l"
+    $process = Start-Process -FilePath $MakeAppxPath -ArgumentList $makeAppxArgs -NoNewWindow -Wait -PassThru
+    
+    if ($process.ExitCode -ne 0) {
+        Write-Log "Failed to create package with exit code $($process.ExitCode)" -Level "Error"
+        return $false
+    }
+    
+    if (-not (Test-Path -Path $OutputPath)) {
+        Write-Log "Output package was not created" -Level "Error"
+        return $false
+    }
+    
+    return $true
+}
+
+# Function to sign the appx/msix package
+function Set-AppxSignature {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$PackagePath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$CertificatePath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$SignToolPath,
+        
+        [Parameter(Mandatory=$true)]
+        [SecureString]$Password
+    )
+    
+    # Sign the package using SignTool
+    $passwordPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+    )
+    
+    $signArgs = "sign /fd SHA256 /a /f `"$CertificatePath`" /p `"$passwordPlain`" `"$PackagePath`""
+    $process = Start-Process -FilePath $SignToolPath -ArgumentList $signArgs -NoNewWindow -Wait -PassThru
+    
+    if ($process.ExitCode -ne 0) {
+        Write-Log "Failed to sign package with exit code $($process.ExitCode)" -Level "Error"
+        return $false
+    }
+    
+    return $true
+}
+
+# Function to install the certificate
+function Install-AppxCertificate {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$CertificatePath
+    )
+    
+    try {
+        Write-Log "Installing certificate for trusted app package signing..." -Level "Info"
+        
+        # Add the certificate to the trusted root store
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+        $cert.Import($CertificatePath)
+        
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store "TrustedPeople", "LocalMachine"
+        $store.Open("ReadWrite")
+        $store.Add($cert)
+        $store.Close()
+        
+        Write-Log "Certificate installed successfully" -Level "Success"
+        return $true
+    }
+    catch {
+        Write-Log "Failed to install certificate: $($_.Exception.Message)" -Level "Error"
+        return $false
+    }
+}
+
+# Main script execution starts here
+
+# Check for administrative privileges
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Log "This script requires administrative privileges. Please restart PowerShell as an Administrator." -Level "Error"
+    exit 1
+}
+
+# Validate input package path
+if (-not (Test-Path -Path $PackagePath)) {
+    Write-Log "Package file not found: $PackagePath" -Level "Error"
+    exit 1
+}
+
+# Set default output path if not provided
+if ([string]::IsNullOrEmpty($OutputPath)) {
+    $OutputPath = Split-Path -Path $PackagePath -Parent
+}
+elseif (-not (Test-Path -Path $OutputPath)) {
+    # Create output directory if it doesn't exist
+    try {
+        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+        Write-Log "Created output directory: $OutputPath" -Level "Info"
+    }
+    catch {
+        Write-Log "Failed to create output directory: $_" -Level "Error"
+        exit 1
+    }
+}
+
+# Find required SDK tools
+$makeAppxPath = Find-SdkTool -ToolName "makeappx"
+$signToolPath = Find-SdkTool -ToolName "signtool"
+
+if (-not $makeAppxPath) {
+    Write-Log "MakeAppx.exe not found. Please install the Windows SDK." -Level "Error"
+    Write-Log "You can download the Windows SDK from: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/" -Level "Info"
+    exit 1
+}
+
+if (-not $signToolPath) {
+    Write-Log "SignTool.exe not found. Please install the Windows SDK." -Level "Error"
+    Write-Log "You can download the Windows SDK from: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/" -Level "Info"
+    exit 1
+}
+
+Write-Log "Found MakeAppx.exe at: $makeAppxPath" -Level "Info"
+Write-Log "Found SignTool.exe at: $signToolPath" -Level "Info"
+
+# Validate if the package signature is already valid or needs updating
+$needsResign = $ForceResign -or -not (Test-AppxPackage -PackagePath $PackagePath)
+
+if (-not $needsResign) {
+    Write-Log "Package signature appears to be valid. Use -ForceResign to override." -Level "Success"
+    exit 0
+}
+
+# Get the package file name and create paths
+$packageFileName = Split-Path -Path $PackagePath -Leaf
+$packageBaseName = [System.IO.Path]::GetFileNameWithoutExtension($packageFileName)
+$packageExtension = [System.IO.Path]::GetExtension($packageFileName)
+
+# Create a working directory
+$workDir = Join-Path -Path $env:TEMP -ChildPath ([Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+
+try {
+    # Extract the package
+    Write-Log "Extracting package contents..." -Level "Info"
+    $extractPath = Join-Path -Path $workDir -ChildPath "Extracted"
+    
+    if (-not (Expand-AppxPackage -PackagePath $PackagePath -ExtractPath $extractPath -MakeAppxPath $makeAppxPath)) {
+        Write-Log "Failed to extract package. Cannot continue." -Level "Error"
+        exit 1
+    }
+    
+    # Create a certificate for signing
+    Write-Log "Creating signing certificate..." -Level "Info"
+    $certPath = Join-Path -Path $workDir -ChildPath "AppxSigningCert.pfx"
+    $certInfo = New-AppxCertificate -CertificatePath $certPath
+    
+    if (-not $certInfo) {
+        Write-Log "Failed to create signing certificate. Cannot continue." -Level "Error"
+        exit 1
+    }
+    
+    # Install the certificate to the trusted people store
+    if (-not (Install-AppxCertificate -CertificatePath $certInfo.CerPath)) {
+        Write-Log "Failed to install certificate. Will continue but package may not be trusted." -Level "Warning"
+    }
+    
+    # Define the output package path
+    $updatedPackagePath = Join-Path -Path $OutputPath -ChildPath $packageFileName
+    if ($OutputPath -eq (Split-Path -Path $PackagePath -Parent) -and $updatedPackagePath -eq $PackagePath) {
+        # If output would overwrite input, create a modified name
+        $updatedPackagePath = Join-Path -Path $OutputPath -ChildPath "$packageBaseName.updated$packageExtension"
+    }
+    
+    # Create a new package
+    Write-Log "Creating updated package..." -Level "Info"
+    if (-not (New-AppxPackage -SourcePath $extractPath -OutputPath $updatedPackagePath -MakeAppxPath $makeAppxPath)) {
+        Write-Log "Failed to create updated package. Cannot continue." -Level "Error"
+        exit 1
+    }
+    
+    # Sign the package
+    Write-Log "Signing package with new certificate..." -Level "Info"
+    if (-not (Set-AppxSignature -PackagePath $updatedPackagePath -CertificatePath $certPath -SignToolPath $signToolPath -Password $certInfo.Password)) {
+        Write-Log "Failed to sign the updated package. Cannot continue." -Level "Error"
+        exit 1
+    }
+    
+    # Verify the updated package
+    if (Test-AppxPackage -PackagePath $updatedPackagePath) {
+        Write-Log "Package signature updated successfully!" -Level "Success"
+        Write-Log "Updated package saved to: $updatedPackagePath" -Level "Success"
+        
+        # Generate installation instructions
+        $instructionsPath = Join-Path -Path $OutputPath -ChildPath "Installation_Instructions.txt"
+        $instructions = @"
+Updated Microsoft Store Application Package
+------------------------------------------
+
+Package: $updatedPackagePath
+Certificate: $($certInfo.CerPath)
+
+Installation Instructions:
+1. The certificate has been installed on this computer in the 'Trusted People' store.
+2. To install the package, run the following command in PowerShell as Administrator:
+
+   Add-AppxPackage -Path "$updatedPackagePath" -ForceUpdateFromAnyVersion
+
+3. If installing on another computer, you will need to install the certificate first:
+
+   Import-Certificate -FilePath "$($certInfo.CerPath)" -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+
+   Then run the installation command.
+
+Note: This package was re-signed with a self-signed certificate. You may need to adjust
+your system's AppLocker or other security policies to allow installation of developer-signed applications.
+"@
+        
+        $instructions | Out-File -FilePath $instructionsPath -Encoding utf8
+        Write-Log "Installation instructions saved to: $instructionsPath" -Level "Info"
+        
+        # Copy the certificate to the output folder for transfer
+        Copy-Item -Path $certInfo.CerPath -Destination $OutputPath
+        Write-Log "Certificate copied to: $(Join-Path -Path $OutputPath -ChildPath (Split-Path -Path $certInfo.CerPath -Leaf))" -Level "Info"
+    }
+    else {
+        Write-Log "Updated package signature validation failed. Package may still have issues." -Level "Warning"
+    }
+}
+catch {
+    Write-Log "An error occurred: $($_.Exception.Message)" -Level "Error"
+    exit 1
+}
+finally {
+    # Clean up temporary files
+    if (Test-Path -Path $workDir) {
+        Remove-Item -Path $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    
+    # Remove the temporary certificate from the certificate store
+    if ($certInfo -and $certInfo.Certificate) {
+        try {
+            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store "My", "CurrentUser"
+            $store.Open("ReadWrite")
+            $store.Remove($certInfo.Certificate)
+            $store.Close()
+        }
+        catch {
+            Write-Log "Warning: Failed to remove temporary certificate from certificate store." -Level "Warning"
+        }
+    }
+}
