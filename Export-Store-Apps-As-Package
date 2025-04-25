@@ -1,0 +1,318 @@
+<#
+.SYNOPSIS
+    Packages an installed Microsoft Store application into a .msix/.appx file for offline installation.
+.DESCRIPTION
+    This script identifies an installed Microsoft Store application and packages it into a
+    properly signed .appx or .msix file that can be transferred to another Windows computer
+    for offline installation.
+.PARAMETER AppName
+    Name or partial name of the application to package (e.g., "Microsoft.WindowsTerminal")
+.PARAMETER OutputPath
+    Directory where the packaged application will be saved
+.PARAMETER IncludeDependencies
+    Switch to include dependencies in the packaging process
+.EXAMPLE
+    .\Package-StoreApp.ps1 -AppName "Microsoft.WindowsTerminal" -OutputPath "C:\Exports"
+.EXAMPLE
+    .\Package-StoreApp.ps1 -AppName "WindowsTerminal" -OutputPath "C:\Exports" -IncludeDependencies
+.NOTES
+    Requires administrative privileges
+    Windows SDK (specifically makeappx.exe) is required
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory=$true)]
+    [string]$AppName,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$OutputPath,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$IncludeDependencies
+)
+
+# Function to write formatted log messages
+function Write-Log {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("Info", "Warning", "Error")]
+        [string]$Level = "Info"
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $color = switch ($Level) {
+        "Info"    { "Cyan" }
+        "Warning" { "Yellow" }
+        "Error"   { "Red" }
+    }
+    
+    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
+}
+
+# Function to find MakeAppx.exe in Windows SDK
+function Find-MakeAppx {
+    $makeAppxPaths = @(
+        # Try common Windows SDK paths
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.22621.0\x64\makeappx.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.22000.0\x64\makeappx.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.19041.0\x64\makeappx.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.18362.0\x64\makeappx.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.17763.0\x64\makeappx.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.17134.0\x64\makeappx.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.16299.0\x64\makeappx.exe"
+    )
+    
+    # Check all paths
+    foreach ($path in $makeAppxPaths) {
+        if (Test-Path -Path $path) {
+            return $path
+        }
+    }
+    
+    # Still not found, try to search recursively
+    $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+    if (Test-Path -Path $sdkRoot) {
+        $foundTools = Get-ChildItem -Path $sdkRoot -Recurse -Filter "makeappx.exe" -ErrorAction SilentlyContinue
+        if ($foundTools.Count -gt 0) {
+            return $foundTools[0].FullName
+        }
+    }
+    
+    # Try to find it in PATH
+    try {
+        $inPath = Get-Command makeappx.exe -ErrorAction SilentlyContinue
+        if ($inPath) {
+            return $inPath.Source
+        }
+    } catch {}
+    
+    return $null
+}
+
+# Function to create a self-contained package from an installed app
+function Export-AppxPackage {
+    param (
+        [Parameter(Mandatory=$true)]
+        [object]$Package,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$OutputPath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$MakeAppxPath
+    )
+    
+    $packageName = $Package.Name
+    $packageVersion = $Package.Version
+    $packageFullName = $Package.PackageFullName
+    $installLocation = $Package.InstallLocation
+    
+    Write-Log "Processing $packageName (version $packageVersion)..."
+    
+    # Create a temporary directory for staging
+    $tempDir = Join-Path -Path $env:TEMP -ChildPath ([Guid]::NewGuid().ToString())
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+    
+    try {
+        # Copy the package files to the temporary location
+        Write-Log "Copying package files from $installLocation to temporary directory..."
+        Copy-Item -Path "$installLocation\*" -Destination $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # Verify the AppxManifest.xml file was copied
+        $manifestPath = Join-Path -Path $tempDir -ChildPath "AppxManifest.xml"
+        if (-not (Test-Path -Path $manifestPath)) {
+            Write-Log "AppxManifest.xml not found for $packageName" -Level "Error"
+            return $null
+        }
+        
+        # Create the output file path
+        $outputFile = Join-Path -Path $OutputPath -ChildPath "$packageFullName.msix"
+        
+        # Create the package using MakeAppx.exe
+        Write-Log "Creating package using MakeAppx.exe..."
+        $makeAppxArgs = "pack /d `"$tempDir`" /p `"$outputFile`" /l"
+        $process = Start-Process -FilePath $MakeAppxPath -ArgumentList $makeAppxArgs -NoNewWindow -Wait -PassThru
+        
+        if ($process.ExitCode -ne 0) {
+            Write-Log "MakeAppx.exe failed with exit code $($process.ExitCode)" -Level "Error"
+            return $null
+        }
+        
+        if (Test-Path -Path $outputFile) {
+            Write-Log "Successfully packaged $packageName to $outputFile" -Level "Info"
+            return $outputFile
+        } else {
+            Write-Log "Failed to create package for $packageName - output file not found" -Level "Error"
+            return $null
+        }
+    }
+    catch {
+        Write-Log "Error packaging $packageName: $_" -Level "Error"
+        return $null
+    }
+    finally {
+        # Clean up the temporary directory
+        if (Test-Path -Path $tempDir) {
+            Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Main script execution starts here
+
+# Check for administrative privileges
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Log "This script requires administrative privileges. Please restart PowerShell as an Administrator." -Level "Error"
+    exit 1
+}
+
+# Create output directory if it doesn't exist
+if (-not (Test-Path -Path $OutputPath)) {
+    try {
+        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+        Write-Log "Created output directory: $OutputPath"
+    }
+    catch {
+        Write-Log "Failed to create output directory: $_" -Level "Error"
+        exit 1
+    }
+}
+
+# If dependencies are included, create a subfolder for them
+$dependencyPath = $null
+if ($IncludeDependencies) {
+    $dependencyPath = Join-Path -Path $OutputPath -ChildPath "Dependencies"
+    if (-not (Test-Path -Path $dependencyPath)) {
+        New-Item -ItemType Directory -Path $dependencyPath -Force | Out-Null
+        Write-Log "Created dependency directory: $dependencyPath"
+    }
+}
+
+# Find MakeAppx.exe
+$makeAppxPath = Find-MakeAppx
+if (-not $makeAppxPath) {
+    Write-Log "MakeAppx.exe not found. Please install the Windows SDK or specify the path manually." -Level "Error"
+    Write-Log "You can download the Windows SDK from: https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/" -Level "Info"
+    exit 1
+}
+Write-Log "Found MakeAppx.exe at: $makeAppxPath"
+
+# Find installed packages matching the pattern
+$packages = Get-AppxPackage -Name "*$AppName*" | Sort-Object -Property Name, Version
+if ($packages.Count -eq 0) {
+    Write-Log "No packages found matching '$AppName'. Please check the name and try again." -Level "Error"
+    exit 1
+}
+
+# If multiple packages are found, let the user choose which one to package
+$selectedPackage = $null
+if ($packages.Count -gt 1) {
+    Write-Log "Multiple packages found matching '$AppName':" -Level "Warning"
+    for ($i = 0; $i -lt $packages.Count; $i++) {
+        Write-Host "[$i] $($packages[$i].Name) (version $($packages[$i].Version))"
+    }
+    
+    $selection = Read-Host "Enter the number of the package to package, or 'all' to package all matching applications"
+    
+    if ($selection -eq "all") {
+        Write-Log "Packaging all matching applications..."
+        $selectedPackages = $packages
+    }
+    elseif ($selection -match '^\d+$' -and [int]$selection -ge 0 -and [int]$selection -lt $packages.Count) {
+        $selectedPackages = @($packages[[int]$selection])
+    }
+    else {
+        Write-Log "Invalid selection. Exiting." -Level "Error"
+        exit 1
+    }
+}
+else {
+    $selectedPackages = @($packages[0])
+}
+
+# Package each selected app
+$packagedFiles = @()
+foreach ($package in $selectedPackages) {
+    $outputFile = Export-AppxPackage -Package $package -OutputPath $OutputPath -MakeAppxPath $makeAppxPath
+    
+    if ($outputFile) {
+        $packagedFiles += $outputFile
+        
+        # Process dependencies if requested
+        if ($IncludeDependencies -and $package.Dependencies -and $package.Dependencies.Count -gt 0) {
+            Write-Log "Processing dependencies for $($package.Name)..."
+            
+            foreach ($dependency in $package.Dependencies) {
+                # Get the dependency package
+                $depPackage = Get-AppxPackage -Name $dependency.Name | Sort-Object -Property Version -Descending | Select-Object -First 1
+                
+                if ($depPackage) {
+                    Write-Log "Packaging dependency: $($depPackage.Name) (version $($depPackage.Version))..."
+                    $depFile = Export-AppxPackage -Package $depPackage -OutputPath $dependencyPath -MakeAppxPath $makeAppxPath
+                    
+                    if ($depFile) {
+                        $packagedFiles += $depFile
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Generate a README file with installation instructions
+if ($packagedFiles.Count -gt 0) {
+    $readmePath = Join-Path -Path $OutputPath -ChildPath "README.txt"
+    $readmeContent = @"
+Microsoft Store Application Package
+---------------------------------
+
+This package contains the following applications:
+$($packagedFiles -join "`r`n")
+
+Installation Instructions:
+1. Copy all files to the target computer
+2. Open PowerShell as Administrator
+3. Navigate to the folder containing the packages
+4. Run the following command to install the application:
+
+"@
+
+    if ($IncludeDependencies -and (Test-Path -Path $dependencyPath)) {
+        $depFiles = Get-ChildItem -Path $dependencyPath -Filter "*.msix" | Select-Object -ExpandProperty Name
+        if ($depFiles) {
+            $depPathParam = "-DependencyPath `".\Dependencies`""
+            $readmeContent += "   Add-AppxPackage -Path `".\$($selectedPackages[0].Name)*.msix`" $depPathParam -ForceUpdateFromAnyVersion`r`n"
+        } else {
+            $readmeContent += "   Add-AppxPackage -Path `".\$($selectedPackages[0].Name)*.msix`" -ForceUpdateFromAnyVersion`r`n"
+        }
+    } else {
+        $readmeContent += "   Add-AppxPackage -Path `".\$($selectedPackages[0].Name)*.msix`" -ForceUpdateFromAnyVersion`r`n"
+    }
+
+    $readmeContent += @"
+
+5. If there are dependency errors, install each dependency first:
+   foreach (`$file in Get-ChildItem -Path `".\Dependencies`" -Filter "*.msix") {
+       Add-AppxPackage -Path `$file.FullName
+   }
+
+6. Then install the main application package.
+
+Note: Some applications may require additional dependencies that weren't packaged.
+"@
+
+    $readmeContent | Out-File -FilePath $readmePath -Encoding utf8
+    Write-Log "Created README file with installation instructions: $readmePath"
+}
+
+Write-Log "Packaging operation completed. $($packagedFiles.Count) package(s) created."
+if ($packagedFiles.Count -gt 0) {
+    Write-Log "Files created:"
+    foreach ($file in $packagedFiles) {
+        Write-Log "- $file"
+    }
+}
