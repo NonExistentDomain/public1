@@ -1,0 +1,505 @@
+function Manage-EdgeInstaller {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [string[]]$ComputerName,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Install", "Upgrade", "Repair", "Uninstall", "ForceUninstall")]
+        [string]$Action,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$EdgeWebView2,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$ForceCopyInstaller,
+        
+        [Parameter(Mandatory = $false)]
+        [int]$MaxConcurrentJobs = 25,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$LogPath = "$env:USERPROFILE\Documents\EdgeInstaller_Logs"
+    )
+
+    Begin {
+        # Create log directory if it doesn't exist
+        if (-not (Test-Path -Path $LogPath)) {
+            New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
+        }
+        
+        $logFile = Join-Path -Path $LogPath -ChildPath "EdgeInstaller_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+        
+        function Write-Log {
+            param (
+                [string]$Message,
+                [string]$Level = "INFO"
+            )
+            
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $logEntry = "[$timestamp] [$Level] $Message"
+            Add-Content -Path $logFile -Value $logEntry
+            
+            # Output to console based on level
+            switch ($Level) {
+                "ERROR" { Write-Host $logEntry -ForegroundColor Red }
+                "WARN"  { Write-Host $logEntry -ForegroundColor Yellow }
+                "INFO"  { Write-Host $logEntry -ForegroundColor White }
+                default { Write-Host $logEntry }
+            }
+        }
+        
+        Write-Log "Starting Edge Installer Management. Action: $Action, WebView2: $EdgeWebView2, ForceCopy: $ForceCopyInstaller"
+        
+        # Source file information
+        $sourceFile = "\\server001\storage$\MicrosoftEdgeEnterprise-x64.msi"
+        $sourceFileInfo = $null
+        
+        try {
+            $sourceFileInfo = Get-Item -Path $sourceFile -ErrorAction Stop
+            Write-Log "Source file found: $sourceFile, Size: $($sourceFileInfo.Length) bytes"
+        }
+        catch {
+            Write-Log "ERROR: Cannot access source file $sourceFile. Error: $_" -Level "ERROR"
+            throw "Cannot access source file. Please verify network connectivity and permissions."
+        }
+        
+        # Create a throttling semaphore for concurrent jobs
+        $throttle = [System.Threading.Semaphore]::new($MaxConcurrentJobs, $MaxConcurrentJobs)
+        $jobs = @()
+        $runspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxConcurrentJobs)
+        $runspacePool.Open()
+        
+        # Create scriptblock for remote execution
+        $scriptBlock = {
+            param (
+                [string]$ComputerName,
+                [string]$Action,
+                [bool]$EdgeWebView2,
+                [bool]$ForceCopy,
+                [string]$SourceFile,
+                [long]$SourceFileSize
+            )
+            
+            $result = [PSCustomObject]@{
+                ComputerName = $ComputerName
+                Action = $Action
+                Success = $false
+                Message = ""
+                StartTime = Get-Date
+                EndTime = $null
+            }
+            
+            try {
+                # Check if computer is online
+                if (-not (Test-Connection -ComputerName $ComputerName -Count 1 -Quiet)) {
+                    $result.Message = "Computer is offline or unreachable"
+                    return $result
+                }
+                
+                # Create destination directory path
+                $destDir = "\\$ComputerName\C$\Updates\EdgeInstaller"
+                $destFile = "$destDir\MicrosoftEdgeEnterprise-x64.msi"
+                
+                # Check if destination directory exists, create if not
+                if (-not (Test-Path -Path $destDir)) {
+                    try {
+                        New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+                    }
+                    catch {
+                        $result.Message = "Failed to create directory on remote computer: $_"
+                        return $result
+                    }
+                }
+                
+                # Determine if file needs to be copied based on requirements
+                $copyFile = $false
+                $copyReason = ""
+                
+                # Force copy check
+                if ($ForceCopy) {
+                    $copyFile = $true
+                    $copyReason = "Force copy enabled"
+                }
+                else {
+                    # Check if destination file exists
+                    if (-not (Test-Path -Path $destFile)) {
+                        $copyFile = $true
+                        $copyReason = "File doesn't exist on destination"
+                    }
+                    else {
+                        # Check file integrity
+                        try {
+                            $destFileInfo = Get-Item -Path $destFile
+                            if ($destFileInfo.Length -ne $SourceFileSize) {
+                                $copyFile = $true
+                                $copyReason = "Destination file size doesn't match source (possible corruption)"
+                            }
+                        }
+                        catch {
+                            $copyFile = $true
+                            $copyReason = "Cannot access destination file info: $_"
+                        }
+                    }
+                }
+                
+                # Copy file if needed and if action requires installer
+                if ($Action -in @("Install", "Upgrade", "Repair") -and $copyFile) {
+                    try {
+                        Copy-Item -Path $SourceFile -Destination $destFile -Force
+                        $copySuccess = $true
+                    }
+                    catch {
+                        $result.Message = "Failed to copy installer: $_"
+                        return $result
+                    }
+                }
+                
+                # Execute the action on the remote computer using Invoke-Command
+                try {
+                    $actionScriptBlock = {
+                        param (
+                            [string]$Action,
+                            [bool]$EdgeWebView2,
+                            [string]$InstallerPath
+                        )
+                        
+                        $targetProduct = if ($EdgeWebView2) { "Microsoft Edge WebView2 Runtime" } else { "Microsoft Edge" }
+                        $logPath = "C:\Windows\Temp\EdgeInstaller_$Action.log"
+                        
+                        # Helper function to find product info
+                        function Get-ProductInfo {
+                            param ([string]$ProductName)
+                            
+                            # Try to find in standard uninstall locations
+                            $uninstallKeys = @(
+                                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                                "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                            )
+                            
+                            $productInfo = Get-ItemProperty $uninstallKeys | 
+                                Where-Object { $_.DisplayName -like "*$ProductName*" } | 
+                                Select-Object DisplayName, DisplayVersion, UninstallString, QuietUninstallString
+                            
+                            return $productInfo
+                        }
+                        
+                        # Helper function to log
+                        function Write-ActionLog {
+                            param ([string]$Message)
+                            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                            $logEntry = "[$timestamp] $Message"
+                            Add-Content -Path $logPath -Value $logEntry
+                        }
+                        
+                        Write-ActionLog "Starting $Action for $targetProduct"
+                        
+                        switch ($Action) {
+                            "Install" {
+                                Write-ActionLog "Installing $targetProduct from $InstallerPath"
+                                $arguments = if ($EdgeWebView2) { "/quiet /forcerestart /install /acceptgraphicseula=1 DONOTCREATEDESKTOPSHORTCUT=true DONOTCREATETASKBARSHORTCUT=true /installsource=sccm /noedgeupdate=1" } else { "/quiet /forcerestart /install /acceptgraphicseula=1 DONOTCREATEDESKTOPSHORTCUT=true DONOTCREATETASKBARSHORTCUT=true /installsource=sccm /noedgeupdate=1" }
+                                Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$InstallerPath`" $arguments" -Wait -NoNewWindow
+                                Write-ActionLog "Installation completed"
+                            }
+                            "Upgrade" {
+                                Write-ActionLog "Upgrading $targetProduct from $InstallerPath"
+                                $arguments = if ($EdgeWebView2) { "/quiet /forcerestart /update /acceptgraphicseula=1 /noedgeupdate=1" } else { "/quiet /forcerestart /update /acceptgraphicseula=1 /noedgeupdate=1" }
+                                Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$InstallerPath`" $arguments" -Wait -NoNewWindow
+                                Write-ActionLog "Upgrade completed"
+                            }
+                            "Repair" {
+                                Write-ActionLog "Repairing $targetProduct from $InstallerPath"
+                                Start-Process -FilePath "msiexec.exe" -ArgumentList "/f `"$InstallerPath`" /quiet" -Wait -NoNewWindow
+                                Write-ActionLog "Repair completed"
+                            }
+                            "Uninstall" {
+                                Write-ActionLog "Uninstalling $targetProduct"
+                                $productInfo = Get-ProductInfo -ProductName $targetProduct
+                                
+                                if ($productInfo) {
+                                    if ($productInfo.QuietUninstallString) {
+                                        $uninstallString = $productInfo.QuietUninstallString
+                                        Write-ActionLog "Using QuietUninstallString: $uninstallString"
+                                        
+                                        # Extract executable and arguments
+                                        if ($uninstallString -match '^"([^"]+)"(.*)$') {
+                                            $executable = $matches[1]
+                                            $arguments = $matches[2]
+                                            Start-Process -FilePath $executable -ArgumentList $arguments -Wait -NoNewWindow
+                                        }
+                                        elseif ($uninstallString -match '^([^\s]+)(.*)$') {
+                                            $executable = $matches[1]
+                                            $arguments = $matches[2]
+                                            Start-Process -FilePath $executable -ArgumentList $arguments -Wait -NoNewWindow
+                                        }
+                                        else {
+                                            # Just execute the string if we can't parse it
+                                            Invoke-Expression $uninstallString
+                                        }
+                                    }
+                                    else {
+                                        Write-ActionLog "Using MSI uninstall"
+                                        # Use MSI uninstall if QuietUninstallString is not available
+                                        $msiCode = $productInfo.UninstallString -replace ".*({[A-Z0-9\-]+}).*", '$1'
+                                        if ($msiCode -match "{[A-Z0-9\-]+}") {
+                                            Start-Process -FilePath "msiexec.exe" -ArgumentList "/x $msiCode /quiet" -Wait -NoNewWindow
+                                        }
+                                        else {
+                                            Write-ActionLog "Cannot find MSI code for uninstallation"
+                                            throw "Cannot find MSI code for uninstallation"
+                                        }
+                                    }
+                                    Write-ActionLog "Uninstall completed"
+                                }
+                                else {
+                                    Write-ActionLog "$targetProduct not found"
+                                    throw "$targetProduct not found"
+                                }
+                            }
+                            "ForceUninstall" {
+                                Write-ActionLog "Force uninstalling $targetProduct"
+                                
+                                # Try normal uninstall first
+                                try {
+                                    $productInfo = Get-ProductInfo -ProductName $targetProduct
+                                    if ($productInfo) {
+                                        if ($productInfo.QuietUninstallString) {
+                                            $uninstallString = $productInfo.QuietUninstallString
+                                            Write-ActionLog "Trying QuietUninstallString first: $uninstallString"
+                                            
+                                            # Extract executable and arguments
+                                            if ($uninstallString -match '^"([^"]+)"(.*)$') {
+                                                $executable = $matches[1]
+                                                $arguments = $matches[2]
+                                                Start-Process -FilePath $executable -ArgumentList $arguments -Wait -NoNewWindow
+                                            }
+                                            elseif ($uninstallString -match '^([^\s]+)(.*)$') {
+                                                $executable = $matches[1]
+                                                $arguments = $matches[2]
+                                                Start-Process -FilePath $executable -ArgumentList $arguments -Wait -NoNewWindow
+                                            }
+                                            else {
+                                                # Just execute the string if we can't parse it
+                                                Invoke-Expression $uninstallString
+                                            }
+                                        }
+                                        else {
+                                            Write-ActionLog "Trying MSI uninstall"
+                                            # Use MSI uninstall if QuietUninstallString is not available
+                                            $msiCode = $productInfo.UninstallString -replace ".*({[A-Z0-9\-]+}).*", '$1'
+                                            if ($msiCode -match "{[A-Z0-9\-]+}") {
+                                                Start-Process -FilePath "msiexec.exe" -ArgumentList "/x $msiCode /quiet" -Wait -NoNewWindow
+                                            }
+                                        }
+                                    }
+                                }
+                                catch {
+                                    Write-ActionLog "Standard uninstall failed: $_. Proceeding with forcible removal."
+                                }
+                                
+                                # Force uninstall by manually removing files, services and registry entries
+                                Write-ActionLog "Starting forcible removal process"
+                                
+                                # Stop processes if they exist
+                                $processNames = if ($EdgeWebView2) { @("msedgewebview2", "WebView2*") } else { @("msedge", "edge") }
+                                foreach ($processName in $processNames) {
+                                    Get-Process -Name $processName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                                    Write-ActionLog "Stopped processes matching $processName"
+                                }
+                                
+                                # Stop and remove services
+                                $serviceNames = if ($EdgeWebView2) { @("*WebView*", "*Edge*", "*Microsoft Edge WebView*") } else { @("*Edge*", "*Microsoft Edge*") }
+                                foreach ($serviceName in $serviceNames) {
+                                    Get-Service -Name $serviceName -ErrorAction SilentlyContinue | ForEach-Object {
+                                        Write-ActionLog "Stopping service: $($_.Name)"
+                                        Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+                                        Write-ActionLog "Removing service: $($_.Name)"
+                                        & sc.exe delete $_.Name
+                                    }
+                                }
+                                
+                                # Remove directories
+                                $directoriesToRemove = if ($EdgeWebView2) {
+                                    @(
+                                        "${env:ProgramFiles(x86)}\Microsoft\EdgeWebView",
+                                        "${env:ProgramFiles}\Microsoft\EdgeWebView",
+                                        "${env:LOCALAPPDATA}\Microsoft\EdgeWebView",
+                                        "${env:LOCALAPPDATA}\Microsoft\Edge\WebView"
+                                    )
+                                } else {
+                                    @(
+                                        "${env:ProgramFiles(x86)}\Microsoft\Edge",
+                                        "${env:ProgramFiles}\Microsoft\Edge",
+                                        "${env:LOCALAPPDATA}\Microsoft\Edge"
+                                    )
+                                }
+                                
+                                foreach ($dir in $directoriesToRemove) {
+                                    if (Test-Path -Path $dir) {
+                                        Write-ActionLog "Removing directory: $dir"
+                                        Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue
+                                    }
+                                }
+                                
+                                # Remove registry entries
+                                $registryPaths = if ($EdgeWebView2) {
+                                    @(
+                                        "HKLM:\SOFTWARE\Microsoft\EdgeWebView",
+                                        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeWebView",
+                                        "HKCU:\SOFTWARE\Microsoft\EdgeWebView"
+                                    )
+                                } else {
+                                    @(
+                                        "HKLM:\SOFTWARE\Microsoft\Edge",
+                                        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Edge",
+                                        "HKCU:\SOFTWARE\Microsoft\Edge"
+                                    )
+                                }
+                                
+                                foreach ($regPath in $registryPaths) {
+                                    if (Test-Path -Path $regPath) {
+                                        Write-ActionLog "Removing registry path: $regPath"
+                                        Remove-Item -Path $regPath -Recurse -Force -ErrorAction SilentlyContinue
+                                    }
+                                }
+                                
+                                # Clean up uninstall registry entries
+                                $uninstallKeys = @(
+                                    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+                                )
+                                
+                                foreach ($key in $uninstallKeys) {
+                                    if (Test-Path -Path $key) {
+                                        $subkeys = Get-ChildItem -Path $key -ErrorAction SilentlyContinue
+                                        foreach ($subkey in $subkeys) {
+                                            $displayName = Get-ItemProperty -Path $subkey.PSPath -Name "DisplayName" -ErrorAction SilentlyContinue
+                                            if ($displayName -and $displayName.DisplayName -like "*$targetProduct*") {
+                                                Write-ActionLog "Removing uninstall registry entry: $($subkey.PSPath)"
+                                                Remove-Item -Path $subkey.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                Write-ActionLog "Force uninstall completed"
+                            }
+                        }
+                        
+                        return "Action $Action completed successfully for $targetProduct"
+                    }
+                    
+                    # Execute the action on the remote computer
+                    $remoteResult = Invoke-Command -ComputerName $ComputerName -ScriptBlock $actionScriptBlock -ArgumentList $Action, $EdgeWebView2, "C:\Updates\EdgeInstaller\MicrosoftEdgeEnterprise-x64.msi" -ErrorAction Stop
+                    
+                    $result.Success = $true
+                    $result.Message = $remoteResult
+                }
+                catch {
+                    $result.Message = "Error executing action on remote computer: $_"
+                }
+            }
+            catch {
+                $result.Message = "General error: $_"
+            }
+            finally {
+                $result.EndTime = Get-Date
+            }
+            
+            return $result
+        }
+    }
+    
+    Process {
+        foreach ($computer in $ComputerName) {
+            # Wait for a slot in the throttle
+            $throttle.WaitOne() | Out-Null
+            
+            Write-Log "Processing computer: $computer"
+            
+            # Create PowerShell instance and runspace
+            $powershell = [powershell]::Create()
+            $powershell.RunspacePool = $runspacePool
+            
+            # Add script and parameters
+            [void]$powershell.AddScript($scriptBlock)
+            [void]$powershell.AddParameter("ComputerName", $computer)
+            [void]$powershell.AddParameter("Action", $Action)
+            [void]$powershell.AddParameter("EdgeWebView2", $EdgeWebView2.IsPresent)
+            [void]$powershell.AddParameter("ForceCopy", $ForceCopyInstaller.IsPresent)
+            [void]$powershell.AddParameter("SourceFile", $sourceFile)
+            [void]$powershell.AddParameter("SourceFileSize", $sourceFileInfo.Length)
+            
+            # Start job and set up event for throttle release
+            $handle = $powershell.BeginInvoke()
+            
+            $job = [PSCustomObject]@{
+                PowerShell = $powershell
+                Handle = $handle
+                Computer = $computer
+                StartTime = Get-Date
+            }
+            
+            # Create a new thread to monitor this job
+            $monitoringThread = [System.Threading.Thread]::new({
+                param($job, $throttle, $logFile)
+                
+                try {
+                    # Wait for the job to complete
+                    $job.PowerShell.EndInvoke($job.Handle)
+                    $result = $job.PowerShell.Commands.Commands[0].Output
+                    
+                    # Log the result
+                    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    $duration = (Get-Date) - $job.StartTime
+                    $durationStr = "{0:hh\:mm\:ss}" -f $duration
+                    
+                    $status = if ($result.Success) { "SUCCESS" } else { "FAILED" }
+                    $logMessage = "[$timestamp] [$status] Computer: $($job.Computer), Action: $($result.Action), Duration: $durationStr, Message: $($result.Message)"
+                    Add-Content -Path $logFile -Value $logMessage
+                }
+                catch {
+                    # Log any errors
+                    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    $logMessage = "[$timestamp] [ERROR] Failed to process results for $($job.Computer): $_"
+                    Add-Content -Path $logFile -Value $logMessage
+                }
+                finally {
+                    # Clean up and release the throttle
+                    $job.PowerShell.Dispose()
+                    $throttle.Release() | Out-Null
+                }
+            })
+            
+            # Pass the throttle and log file to the thread
+            $monitoringThread.Start(@($job, $throttle, $logFile))
+            
+            # Add job to list
+            $jobs += $job
+        }
+    }
+    
+    End {
+        Write-Log "All jobs submitted. Waiting for completion..."
+        
+        # Wait for all jobs to complete
+        while ($jobs | Where-Object { -not $_.Handle.IsCompleted }) {
+            $running = @($jobs | Where-Object { -not $_.Handle.IsCompleted })
+            $completed = @($jobs | Where-Object { $_.Handle.IsCompleted }).Count
+            $total = $jobs.Count
+            
+            Write-Progress -Activity "Processing Edge Installer Management" -Status "Running: $($running.Count) - Completed: $completed of $total" -PercentComplete (($completed / $total) * 100)
+            
+            Start-Sleep -Seconds 1
+        }
+        
+        # Final cleanup
+        Write-Progress -Activity "Processing Edge Installer Management" -Completed
+        
+        # Close the runspace pool
+        $runspacePool.Close()
+        $runspacePool.Dispose()
+        
+        Write-Log "All jobs completed. See log file for details: $logFile"
+        Write-Host "All jobs completed. See log file for details: $logFile" -ForegroundColor Green
+    }
+}
