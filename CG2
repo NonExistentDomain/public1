@@ -1,0 +1,353 @@
+# Check and Enable Secure Boot and Credential Guard
+# Run as Administrator
+
+# Function to check if script is running with admin privileges
+function Test-Administrator {
+    $currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $currentUser.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Function to provide remediation steps for component issues
+function Get-RemediationSteps {
+    param (
+        [string]$Component,
+        $Status
+    )
+    
+    if ($Status) { return "" }
+    
+    switch ($Component) {
+        "SecureBoot" {
+            return @"
+REMEDIATION STEPS FOR SECURE BOOT:
+1. Access your UEFI firmware settings:
+   - In Windows, hold Shift while clicking Restart, then navigate to Troubleshoot > Advanced options > UEFI Firmware Settings
+2. Look for 'Secure Boot' option in the security section of your firmware
+3. Ensure 'Secure Boot' is set to 'Enabled'
+4. If using legacy OS that doesn't support Secure Boot, you may need to:
+   - Disable CSM/Legacy boot mode first
+   - Convert disk from MBR to GPT using MBR2GPT.exe tool from Windows
+   - Command: mbr2gpt.exe /convert /allowFullOS
+5. Save changes and exit UEFI settings
+
+NOTE: You may need to reinstall your OS if currently using legacy BIOS mode
+"@
+        }
+        "VirtualizationFirmwareEnabled" {
+            return @"
+REMEDIATION STEPS FOR HARDWARE VIRTUALIZATION:
+1. Access your UEFI/BIOS settings (as described above)
+2. Look for settings called:
+   - 'Intel Virtualization Technology' (Intel VT-x)
+   - 'AMD-V' or 'SVM Mode' (for AMD processors)
+3. Enable this setting
+4. Save changes and exit UEFI settings
+
+NOTE: This is required for Credential Guard and other virtualization-based security features
+"@
+        }
+        "VTd" {
+            return @"
+REMEDIATION STEPS FOR VT-d/AMD-Vi:
+1. Access your UEFI/BIOS settings (as described above)
+2. Look for settings called:
+   - 'Intel VT-d' (for Intel processors)
+   - 'AMD-Vi' or 'IOMMU' (for AMD processors)
+3. Enable this setting
+4. Save changes and exit UEFI settings
+
+NOTE: This extension to virtualization helps protect against DMA attacks
+"@
+        }
+        "SLAT" {
+            return @"
+REMEDIATION STEPS FOR SLAT CAPABILITY:
+This is a hardware feature of your CPU and cannot be enabled if not present.
+Required hardware:
+- Intel processors: 'EPT' feature (Extended Page Tables), present in most CPUs since 2008
+- AMD processors: 'RVI' feature (Rapid Virtualization Indexing), present in most CPUs since 2008
+
+If your CPU lacks this feature, you may need to upgrade your hardware to use Credential Guard.
+"@
+        }
+        "TPM" {
+            return @"
+REMEDIATION STEPS FOR TPM:
+1. Access your UEFI/BIOS settings (as described above)
+2. Look for 'TPM', 'Security Device', or 'PTT' (Intel Platform Trust Technology)
+3. Ensure it's enabled
+4. If your system has no TPM:
+   - Consider installing a compatible TPM module if your motherboard supports it
+   - Or upgrade to hardware that includes TPM 2.0 support
+
+NOTE: TPM 2.0 is required for full security capabilities in Windows 11 and recommended for Credential Guard
+"@
+        }
+        "Windows10" {
+            return @"
+REMEDIATION STEPS FOR WINDOWS VERSION:
+Credential Guard requires Windows 10/11 Enterprise or Education editions, or Windows Server 2016+.
+
+If you're on Windows 10/11 Home or Pro:
+1. Upgrade to Windows 10/11 Enterprise or Education edition
+   - This might require a new license or using Windows Enterprise E3/E5 licensing
+
+If you're on an older Windows version:
+1. Backup your data
+2. Upgrade to Windows 10/11 or newer
+"@
+        }
+        "EnterpriseEdition" {
+            return @"
+REMEDIATION STEPS FOR WINDOWS EDITION:
+Credential Guard requires Enterprise, Education, or Server editions of Windows.
+1. Upgrade your Windows edition to Enterprise or Education
+   - This typically requires purchasing a new license or using volume licensing
+   - Windows Pro for Workstations may also support some VBS features
+
+NOTE: Windows 10/11 Home and Pro editions do not support Credential Guard
+"@
+        }
+        "UEFI" {
+            return @"
+REMEDIATION STEPS FOR UEFI BOOT MODE:
+Your system is currently running in Legacy BIOS mode. To enable UEFI boot:
+1. Backup all your data
+2. Convert your system disk from MBR to GPT:
+   - For a system already running Windows: use MBR2GPT.exe utility
+     Command: mbr2gpt.exe /validate /allowFullOS
+     If validation passes: mbr2gpt.exe /convert /allowFullOS
+   - For a new installation: during Windows setup, format using GPT
+
+3. Access your firmware settings and disable 'Legacy Boot' or 'CSM'
+4. Enable 'UEFI Boot Mode'
+5. Save changes and restart
+
+WARNING: This is a complex process that may require reinstalling Windows if conversion fails
+"@
+        }
+    }
+}
+
+# Check for admin rights
+if (-not (Test-Administrator)) {
+    Write-Host "This script requires administrative privileges. Please run as Administrator." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Checking system requirements for Secure Boot and Credential Guard..." -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------------" -ForegroundColor Cyan
+
+# Check for Secure Boot capability and status
+try {
+    $secureBootStatus = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+    $secureBootCapable = $?
+} catch {
+    $secureBootCapable = $false
+    $secureBootStatus = $false
+}
+
+if ($secureBootCapable) {
+    Write-Host "Device is Secure Boot capable." -ForegroundColor Green
+    
+    if ($secureBootStatus) {
+        Write-Host "Secure Boot is already enabled." -ForegroundColor Green
+    } else {
+        Write-Host "Secure Boot is currently disabled." -ForegroundColor Yellow
+        Write-Host (Get-RemediationSteps -Component "SecureBoot" -Status $false) -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "Device is not Secure Boot capable or Secure Boot status could not be determined." -ForegroundColor Red
+    Write-Host (Get-RemediationSteps -Component "SecureBoot" -Status $false) -ForegroundColor Yellow
+    Write-Host "Additionally, check if your system firmware is up to date, as firmware updates may add Secure Boot support." -ForegroundColor Yellow
+}
+
+# Check for Credential Guard capability
+Write-Host "`nChecking Credential Guard requirements..." -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------------" -ForegroundColor Cyan
+
+# Check for hardware requirements
+$processorInfo = Get-WmiObject -Class Win32_Processor
+$isVirtualizationEnabled = ($processorInfo | Where-Object { $_.VirtualizationFirmwareEnabled -eq $true }).Count -gt 0
+$vtdInfo = Get-WmiObject -Namespace root\wmi -Class MSSmBios_RawSMBiosTables -ErrorAction SilentlyContinue
+$isVTdEnabled = if ($vtdInfo) { $vtdInfo.SMBiosData -match "VT-d|IOMMU" } else { $false }
+$isSLATCapable = ($processorInfo | Where-Object { $_.SecondLevelAddressTranslationExtensions -eq $true }).Count -gt 0
+
+# Alternative check for SLAT if the above doesn't work
+if (-not $isSLATCapable) {
+    # Check for SLAT by processor brand and generation
+    $cpuName = $processorInfo[0].Name
+    # Most Intel CPUs since Nehalem (2008) and AMD CPUs since Barcelona (2008) support SLAT
+    $isSLATCapable = ($cpuName -match "Intel.*Core.*i[3579]|Xeon|AMD.*Ryzen|AMD.*FX") -and -not ($cpuName -match "Pentium|Celeron|Atom")
+}
+
+$tpmVersion = Get-WmiObject -Namespace root\CIMV2\Security\MicrosoftTpm -Class Win32_Tpm -ErrorAction SilentlyContinue
+$isTpmPresent = ($tpmVersion -ne $null)
+$isTpm2 = if($isTpmPresent) { ($tpmVersion.SpecVersion -match "2\.0") } else { $false }
+
+# Check OS requirements
+$osInfo = Get-WmiObject Win32_OperatingSystem
+$osCaption = $osInfo.Caption
+$osVersion = [Version]$osInfo.Version
+$isWindows10OrLater = $osVersion -ge [Version]"10.0"
+$isEnterpriseOrProEdition = $osCaption -match "Enterprise|Education|Server"
+
+# Check UEFI mode
+$isUEFI = $false
+try {
+    $isUEFI = (Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\SecureBoot\State" -ErrorAction SilentlyContinue).UEFISecureBootEnabled -eq 1
+} catch {
+    # If the registry key doesn't exist, system is likely in legacy BIOS mode
+    $isUEFI = $false
+}
+if (-not $isUEFI) {
+    # Alternative check for UEFI mode
+    $isUEFI = (Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\SecureBoot" -ErrorAction SilentlyContinue) -ne $null
+}
+
+# Display status with colors
+Write-Host "Hardware virtualization enabled: $isVirtualizationEnabled" -ForegroundColor $(if($isVirtualizationEnabled) { "Green" } else { "Red" })
+if (-not $isVirtualizationEnabled) {
+    Write-Host (Get-RemediationSteps -Component "VirtualizationFirmwareEnabled" -Status $isVirtualizationEnabled) -ForegroundColor Yellow
+}
+
+Write-Host "VT-d or AMD-Vi present: $isVTdEnabled" -ForegroundColor $(if($isVTdEnabled) { "Green" } else { "Red" })
+if (-not $isVTdEnabled) {
+    Write-Host (Get-RemediationSteps -Component "VTd" -Status $isVTdEnabled) -ForegroundColor Yellow
+}
+
+Write-Host "SLAT capable: $isSLATCapable" -ForegroundColor $(if($isSLATCapable) { "Green" } else { "Red" })
+if (-not $isSLATCapable) {
+    Write-Host (Get-RemediationSteps -Component "SLAT" -Status $isSLATCapable) -ForegroundColor Yellow
+}
+
+Write-Host "TPM present: $isTpmPresent" -ForegroundColor $(if($isTpmPresent) { "Green" } else { "Red" })
+Write-Host "TPM 2.0: $isTpm2" -ForegroundColor $(if($isTpm2) { "Green" } else { "Red" })
+if (-not $isTpmPresent -or -not $isTpm2) {
+    Write-Host (Get-RemediationSteps -Component "TPM" -Status $isTpmPresent) -ForegroundColor Yellow
+}
+
+Write-Host "Windows 10 or later: $isWindows10OrLater" -ForegroundColor $(if($isWindows10OrLater) { "Green" } else { "Red" })
+if (-not $isWindows10OrLater) {
+    Write-Host (Get-RemediationSteps -Component "Windows10" -Status $isWindows10OrLater) -ForegroundColor Yellow
+}
+
+Write-Host "Enterprise/Education Edition: $isEnterpriseOrProEdition" -ForegroundColor $(if($isEnterpriseOrProEdition) { "Green" } else { "Red" })
+if (-not $isEnterpriseOrProEdition) {
+    Write-Host (Get-RemediationSteps -Component "EnterpriseEdition" -Status $isEnterpriseOrProEdition) -ForegroundColor Yellow
+}
+
+Write-Host "UEFI boot mode: $isUEFI" -ForegroundColor $(if($isUEFI) { "Green" } else { "Red" })
+if (-not $isUEFI) {
+    Write-Host (Get-RemediationSteps -Component "UEFI" -Status $isUEFI) -ForegroundColor Yellow
+}
+
+$credentialGuardCapable = $isVirtualizationEnabled -and $isSLATCapable -and $isTpmPresent -and $isWindows10OrLater -and $isEnterpriseOrProEdition -and $isUEFI
+
+if ($credentialGuardCapable) {
+    Write-Host "`nDevice meets the requirements for Credential Guard." -ForegroundColor Green
+    
+    # Check if Credential Guard is already enabled
+    $credGuardStatus = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction SilentlyContinue
+    $lsaCfgFlags = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\LSA" -ErrorAction SilentlyContinue).LsaCfgFlags
+    $credGuardRunning = if ($credGuardStatus) { $credGuardStatus.SecurityServicesRunning -contains 1 } else { $false }
+    $credGuardConfigured = if ($lsaCfgFlags) { ($lsaCfgFlags -band 1) -eq 1 } else { $false }
+    
+    if ($credGuardRunning) {
+        Write-Host "Credential Guard is already running." -ForegroundColor Green
+    } elseif ($credGuardConfigured) {
+        Write-Host "Credential Guard is configured but not currently running. A reboot may be required." -ForegroundColor Yellow
+    } else {
+        Write-Host "Enabling Credential Guard..." -ForegroundColor Yellow
+        
+        try {
+            # Create a detailed explanation of what we're doing
+            Write-Host @"
+            
+CONFIGURING CREDENTIAL GUARD:
+Making the following changes:
+1. Enabling registry keys for Credential Guard
+2. Configuring Device Guard policies
+3. Enabling required Hyper-V features
+"@ -ForegroundColor Cyan
+            
+            # Enable Credential Guard via registry
+            $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\LSA"
+            if (!(Test-Path $lsaPath)) {
+                New-Item -Path $lsaPath -Force | Out-Null
+            }
+            
+            Write-Host "Setting LSA registry key to enable Credential Guard protection..." -ForegroundColor Yellow
+            Set-ItemProperty -Path $lsaPath -Name "LsaCfgFlags" -Value 1 -Type DWORD -Force
+            
+            # Enable Hyper-V feature if not already enabled
+            $hyperVStatus = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
+            if ($hyperVStatus -and $hyperVStatus.State -ne "Enabled") {
+                Write-Host "Enabling Hyper-V features required for Credential Guard..." -ForegroundColor Yellow
+                Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart -ErrorAction SilentlyContinue
+            }
+            
+            # Create DeviceGuard configuration
+            $devGuardPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+            if (!(Test-Path $devGuardPath)) {
+                New-Item -Path $devGuardPath -Force | Out-Null
+            }
+            
+            Write-Host "Configuring DeviceGuard policy settings..." -ForegroundColor Yellow
+            Set-ItemProperty -Path $devGuardPath -Name "EnableVirtualizationBasedSecurity" -Value 1 -Type DWORD -Force
+            Set-ItemProperty -Path $devGuardPath -Name "RequirePlatformSecurityFeatures" -Value 1 -Type DWORD -Force
+            Set-ItemProperty -Path $devGuardPath -Name "LsaCfgFlags" -Value 1 -Type DWORD -Force
+            
+            Write-Host @"
+
+CREDENTIAL GUARD CONFIGURATION COMPLETE:
+All necessary registry changes have been made to enable Credential Guard.
+A system restart is required for changes to take effect.
+
+After restart, verify Credential Guard is running by using the following command:
+Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard
+
+A value of 1 in SecurityServicesRunning indicates Credential Guard is active.
+"@ -ForegroundColor Green
+            
+            $rebootPrompt = Read-Host "Do you want to restart the computer now? (Y/N)"
+            if ($rebootPrompt -eq "Y" -or $rebootPrompt -eq "y") {
+                Restart-Computer -Force
+            }
+        } catch {
+            Write-Host "Error enabling Credential Guard: $_" -ForegroundColor Red
+            Write-Host "You may need to configure Credential Guard using Group Policy or UEFI configuration utility." -ForegroundColor Yellow
+        }
+    }
+} else {
+    Write-Host "`nDevice does not meet all requirements for Credential Guard." -ForegroundColor Red
+    
+    Write-Host @"
+
+CREDENTIAL GUARD REQUIREMENTS SUMMARY:
+The following components need to be addressed before Credential Guard can be enabled:
+"@ -ForegroundColor Yellow
+    
+    if (-not $isVirtualizationEnabled) { Write-Host "- Hardware virtualization is disabled" -ForegroundColor Red }
+    if (-not $isVTdEnabled) { Write-Host "- VT-d/AMD-Vi is not enabled" -ForegroundColor Red }
+    if (-not $isSLATCapable) { Write-Host "- SLAT capability is missing" -ForegroundColor Red }
+    if (-not $isTpmPresent) { Write-Host "- TPM is not present" -ForegroundColor Red }
+    if ($isTpmPresent -and -not $isTpm2) { Write-Host "- TPM 2.0 is recommended (current version is 1.2)" -ForegroundColor Red }
+    if (-not $isWindows10OrLater) { Write-Host "- Windows 10/11 or later is required" -ForegroundColor Red }
+    if (-not $isEnterpriseOrProEdition) { Write-Host "- Enterprise/Education edition is required" -ForegroundColor Red }
+    if (-not $isUEFI) { Write-Host "- UEFI boot mode is required" -ForegroundColor Red }
+    
+    Write-Host @"
+
+Please address these requirements using the detailed remediation steps provided above.
+Once all requirements are met, run this script again to enable Credential Guard.
+"@ -ForegroundColor Yellow
+}
+
+# Final output - create a summary report
+Write-Host "`n------------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host "SYSTEM SECURITY CAPABILITY SUMMARY:" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host "Secure Boot: $(if($secureBootCapable){"CAPABLE"}else{"NOT CAPABLE"}) - $(if($secureBootStatus){"ENABLED"}else{"DISABLED"})" -ForegroundColor $(if($secureBootCapable -and $secureBootStatus){"Green"}elseif($secureBootCapable){"Yellow"}else{"Red"})
+Write-Host "Credential Guard: $(if($credentialGuardCapable){"CAPABLE"}else{"NOT CAPABLE"}) - $(if($credGuardRunning){"RUNNING"}elseif($credGuardConfigured){"CONFIGURED"}else{"DISABLED"})" -ForegroundColor $(if($credentialGuardCapable -and $credGuardRunning){"Green"}elseif($credentialGuardCapable){"Yellow"}else{"Red"})
+Write-Host "------------------------------------------------------------------" -ForegroundColor Cyan
