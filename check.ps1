@@ -1,44 +1,42 @@
-# PowerShell script to identify applications using NetFx40_LegacySecurityPolicy
-# and guide the administrator on remediation actions per DoD STIG guidelines
+# PowerShell script to automatically identify and remediate NetFx40_LegacySecurityPolicy in .NET config files
 
-# Define the registry paths to check
-$registryPaths = @(
-    "HKLM:\SOFTWARE\Microsoft\.NETFramework",
-    "HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework"
-)
+# Define the search path
+targetPath = "C:\"
 
-$legacyPolicyApps = @()
+# Find all .exe.config files and scan for NetFx40_LegacySecurityPolicy
+$configFiles = Get-ChildItem -Path $targetPath -Filter "*.exe.config" -Recurse -ErrorAction SilentlyContinue
 
-# Function to check registry keys for LegacySecurityPolicy
-foreach ($path in $registryPaths) {
-    if (Test-Path $path) {
-        Get-ChildItem -Path $path | ForEach-Object {
-            $subKey = $_.PSPath
-            $legacyPolicy = Get-ItemProperty -Path $subKey -Name "NetFx40_LegacySecurityPolicy" -ErrorAction SilentlyContinue
-            if ($legacyPolicy -and $legacyPolicy.NetFx40_LegacySecurityPolicy -eq 1) {
-                $appDetails = [PSCustomObject]@{
-                    ApplicationRegistryPath = $subKey
-                    LegacyPolicyEnabled     = $legacyPolicy.NetFx40_LegacySecurityPolicy
-                }
-                $legacyPolicyApps += $appDetails
+$foundIssues = @()
+
+foreach ($file in $configFiles) {
+    [xml]$xmlContent = Get-Content $file.FullName -ErrorAction SilentlyContinue
+
+    if ($xmlContent) {
+        $legacyPolicyNodes = $xmlContent.configuration.runtime.NetFx40_LegacySecurityPolicy
+
+        if ($legacyPolicyNodes -and $legacyPolicyNodes.enabled -eq "true") {
+            $foundIssues += [PSCustomObject]@{
+                FilePath  = $file.FullName
+                PolicySet = $legacyPolicyNodes.enabled
             }
+
+            # Disable the legacy security policy
+            $legacyPolicyNodes.enabled = "false"
+
+            # Backup original file
+            Copy-Item -Path $file.FullName -Destination ($file.FullName + ".backup") -Force
+
+            # Save updated config file
+            $xmlContent.Save($file.FullName)
         }
     }
 }
 
-# Output findings
-if ($legacyPolicyApps.Count -gt 0) {
-    Write-Output "Applications with NetFx40_LegacySecurityPolicy enabled detected:"
-    $legacyPolicyApps | Format-Table -AutoSize
-
-    Write-Warning "CAS policy is enabled for these applications. Ensure previous .NET STIG guidance is applied."
-    Write-Warning "Refer to the DISA .NET Framework STIG document to apply necessary security configurations."
-
-    # Example remediation action (manual review required):
-    # Set NetFx40_LegacySecurityPolicy to 0 if it's safe to disable
-    # foreach ($app in $legacyPolicyApps) {
-    #     Set-ItemProperty -Path $app.ApplicationRegistryPath -Name "NetFx40_LegacySecurityPolicy" -Value 0
-    # }
+# Output the results
+if ($foundIssues.Count -gt 0) {
+    Write-Output "Applications with NetFx40_LegacySecurityPolicy enabled found and corrected:"
+    $foundIssues | Format-Table -AutoSize
+    Write-Warning "Original configuration files have been backed up with a .backup extension."
 } else {
     Write-Output "No applications with NetFx40_LegacySecurityPolicy enabled were detected."
 }
